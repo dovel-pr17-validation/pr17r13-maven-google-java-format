@@ -1,0 +1,303 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+package com.google.googlejavaformat.java;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Range;
+import com.google.common.collect.RangeSet;
+import com.google.common.collect.TreeRangeSet;
+import com.google.common.io.CharSink;
+import com.google.common.io.CharSource;
+import com.google.errorprone.annotations.Immutable;
+import com.google.googlejavaformat.CommentsHelper;
+import com.google.googlejavaformat.FormattingError;
+import com.google.googlejavaformat.Newlines;
+import com.google.googlejavaformat.layout.Doc;
+import com.google.googlejavaformat.layout.LayoutBuilder;
+import com.google.googlejavaformat.layout.LayoutSolver;
+import com.sun.tools.javac.tree.JCTree.JCCompilationUnit;
+import com.sun.tools.javac.util.Context;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import javax.tools.Diagnostic;
+import javax.tools.JavaFileObject;
+import org.jspecify.annotations.Nullable;
+
+/// This is google-java-format, a Java formatter that follows the Google Java Style Guide quite
+/// precisely---to the letter and to the spirit.
+///
+/// This formatter uses the javac parser to generate an AST. Because the AST loses information about
+/// the non-tokens in the input (including newlines, comments, etc.), and even some tokens (e.g.,
+/// optional commas or semicolons), this formatter lexes the input again and follows along in the
+/// resulting list of tokens. Its lexer splits all multi-character operators (like "&gt;&gt;") into
+/// multiple single-character operators. Each non-token is assigned to a token---non-tokens
+/// following a token on the same line go with that token; those following go with the next token---
+/// and there is a final EOF token to hold final comments.
+///
+/// The formatter walks the AST with [JavaInputAstVisitor] to emit formatting events to a
+/// [LayoutBuilder], which splices in comments from the token stream and builds a structured
+/// Wadler-style [Doc] \[1] using formatting rules adapted from Greg Nelson and Derek Oppen \[2--3].
+/// As the AST is walked, guessed optional tokens that are absent from the input are dropped, and
+/// any mismatch between the tokens emitted by the visitor and the input token stream fails
+/// formatting, ensuring that the output matches the input tokens. Finally, [LayoutSolver] lays out
+/// the [Doc] in the given width.
+///
+/// This formatter also produces data structures of which tokens and comments appear where on the
+/// input, and on the output, to help output a partial reformatting of a slightly edited input.
+///
+/// Instances of the formatter are immutable and thread-safe.
+///
+/// [1] Wadler, Philip. ["A prettier
+/// printer"](https://homepages.inf.ed.ac.uk/wadler/papers/prettier/prettier.pdf). The Fun of
+/// Programming, Palgrave Macmillan, 2003, pp. 223–243.
+///
+/// [2] Nelson, Greg, and John DeTreville. Personal communication.
+///
+/// [3] Oppen, Derek C. "Prettyprinting". ACM Transactions on Programming Languages and Systems,
+/// Volume 2 Issue 4, Oct. 1980, pp. 465–483.
+@Immutable
+public final class Formatter {
+
+  public static final int MAX_LINE_LENGTH = 100;
+
+  static final Range<Integer> EMPTY_RANGE = Range.closedOpen(-1, -1);
+
+  private final JavaFormatterOptions options;
+
+  /// A new Formatter instance with default options.
+  public Formatter() {
+    this(JavaFormatterOptions.defaultOptions());
+  }
+
+  public Formatter(JavaFormatterOptions options) {
+    this.options = options;
+  }
+
+  JavaFormatterOptions options() {
+    return options;
+  }
+
+  /// Construct a `Formatter` given a Java compilation unit. Parses the code; builds a [JavaInput]
+  /// and the corresponding [JavaOutput].
+  ///
+  /// @param javaInput the input, a Java compilation unit
+  /// @param javaOutput the [JavaOutput]
+  /// @param options the [JavaFormatterOptions]
+  static void format(final JavaInput javaInput, JavaOutput javaOutput, JavaFormatterOptions options)
+      throws FormatterException {
+    JCCompilationUnit unit = javaInput.getCompilationUnit();
+    if (unit == null) {
+      Context context = new Context();
+      List<Diagnostic<? extends JavaFileObject>> errorDiagnostics = new ArrayList<>();
+      unit =
+          Trees.parse(
+              context, errorDiagnostics, /* allowStringFolding= */ false, javaInput.getText());
+      if (!errorDiagnostics.isEmpty()) {
+        throw FormatterException.fromJavacDiagnostics(errorDiagnostics);
+      }
+      javaInput.setCompilationUnit(unit);
+    }
+    LayoutBuilder builder = new LayoutBuilder(javaInput, javaOutput);
+    ImmutableSet.Builder<Integer> markdownJavadocPositions = ImmutableSet.builder();
+    // Output the compilation unit.
+    JavaInputAstVisitor visitor =
+        new JavaInputAstVisitor(builder, options.indentationMultiplier(), markdownJavadocPositions);
+    visitor.scan(unit, null);
+    builder.sync(javaInput.getText().length());
+    builder.drain();
+    var doc = builder.build();
+    CommentsHelper commentsHelper =
+        new JavaCommentsHelper(
+            Newlines.guessLineSeparator(javaInput.getText()),
+            options,
+            markdownJavadocPositions.build());
+    LayoutSolver.format(doc, options.maxLineLength(), javaOutput, commentsHelper);
+    javaOutput.flush();
+  }
+
+  static boolean errorDiagnostic(Diagnostic<?> input) {
+    if (input.getKind() != Diagnostic.Kind.ERROR) {
+      return false;
+    }
+    // accept constructor-like method declarations that don't match the name of their
+    // enclosing class
+    return !input.getCode().equals("compiler.err.invalid.meth.decl.ret.type.req");
+  }
+
+  /// Format the given input (a Java compilation unit) into the output stream.
+  ///
+  /// @throws FormatterException if the input cannot be parsed
+  public void formatSource(CharSource input, CharSink output)
+      throws FormatterException, IOException {
+    // TODO(cushon): proper support for streaming input/output. Input may
+    // not be feasible (parsing) but output should be easier.
+    output.write(formatSource(input.read()));
+  }
+
+  /// Format an input string (a Java compilation unit) into an output string.
+  ///
+  /// Leaves import statements untouched.
+  ///
+  /// @param input the input string
+  /// @return the output string
+  /// @throws FormatterException if the input string cannot be parsed
+  public String formatSource(String input) throws FormatterException {
+    return formatSource(input, ImmutableList.of(Range.closedOpen(0, input.length())));
+  }
+
+  /// Format an input string (a Java compilation unit), for only the specified character ranges.
+  /// These ranges are extended as necessary (e.g., to encompass whole lines).
+  ///
+  /// @param input the input string
+  /// @param characterRanges the character ranges to be reformatted
+  /// @return the output string
+  /// @throws FormatterException if the input string cannot be parsed
+  public String formatSource(String input, Collection<Range<Integer>> characterRanges)
+      throws FormatterException {
+    return formatSource(
+        input,
+        characterRanges,
+        /* removeUnusedImports= */ false,
+        /* sortImports= */ false,
+        /* reflowLongStrings= */ false);
+  }
+
+  String formatSource(
+      String input,
+      Collection<Range<Integer>> characterRanges,
+      boolean removeUnusedImports,
+      boolean sortImports,
+      boolean reflowLongStrings)
+      throws FormatterException {
+    ImmutableSet<CleanupPass> passes =
+        Cleanups.enabledPasses(
+            options.cleanup(), removeUnusedImports, options.reorderModifiers(), sortImports);
+    Cleanups.Result cleaned = Cleanups.apply(input, characterRanges, options.style(), passes);
+    String formatted =
+        JavaOutput.applyReplacements(
+            cleaned.contents(),
+            getFormatReplacements(cleaned.contents(), cleaned.characterRanges(), cleaned.unit()));
+    if (reflowLongStrings) {
+      formatted = StringWrapper.wrap(options.maxLineLength(), formatted, this);
+    }
+    return formatted;
+  }
+
+  /// Formats an input string (a Java compilation unit) and fixes imports.
+  ///
+  /// Fixing imports includes ordering, spacing, and removal of unused import statements.
+  ///
+  /// @param input the input string
+  /// @return the output string
+  /// @throws FormatterException if the input string cannot be parsed
+  /// @see <a
+  ///   href="https://google.github.io/styleguide/javaguide.html#s3.3.3-import-ordering-and-spacing">
+  ///   Google Java Style Guide - 3.3.3 Import ordering and spacing</a>
+  public String formatSourceAndFixImports(String input) throws FormatterException {
+    return formatSource(
+        input,
+        ImmutableList.of(Range.closedOpen(0, input.length())),
+        /* removeUnusedImports= */ true,
+        /* sortImports= */ true,
+        /* reflowLongStrings= */ true);
+  }
+
+  /// Fixes imports in the given Java source string without performing general code formatting.
+  ///
+  /// @param input the input string
+  /// @param style the code style controlling import ordering
+  /// @param removeUnusedImports whether to remove unused imports
+  /// @param sortImports whether to sort imports
+  /// @return the output string with imports fixed
+  /// @throws FormatterException if the input string cannot be parsed
+  public static String fixImports(
+      String input,
+      JavaFormatterOptions.Style style,
+      boolean removeUnusedImports,
+      boolean sortImports)
+      throws FormatterException {
+    ImmutableSet<CleanupPass> passes =
+        Cleanups.enabledPasses(
+            /* cleanup= */ false, removeUnusedImports, /* reorderModifiers= */ false, sortImports);
+    Cleanups.Result result =
+        Cleanups.apply(input, ImmutableList.of(Range.closedOpen(0, input.length())), style, passes);
+    return result.contents();
+  }
+
+  /// Emit a list of [Replacement]s to convert from input to output.
+  ///
+  /// This is a whitespace-only API that performs core layout and whitespace formatting on the
+  /// requested ranges. It does not perform AST-based cleanups (such as brace insertion or modifier
+  /// cleanup), nor does it modify unformatted code outside the requested ranges (such as file-wide
+  /// blank line or trailing whitespace cleanup).
+  ///
+  /// @param input the input compilation unit
+  /// @param characterRanges the character ranges to reformat
+  /// @return a list of [Replacement]s, sorted from low index to high index, without overlaps
+  /// @throws FormatterException if the input string cannot be parsed
+  public ImmutableList<Replacement> getFormatReplacements(
+      String input, Collection<Range<Integer>> characterRanges) throws FormatterException {
+    return getFormatReplacements(input, characterRanges, /* unit= */ null);
+  }
+
+  ImmutableList<Replacement> getFormatReplacements(
+      String input, Collection<Range<Integer>> characterRanges, @Nullable JCCompilationUnit unit)
+      throws FormatterException {
+    JavaInput javaInput = new JavaInput(input);
+    if (unit != null) {
+      javaInput.setCompilationUnit(unit);
+    }
+
+    String lineSeparator = Newlines.guessLineSeparator(input);
+    JavaOutput javaOutput =
+        new JavaOutput(
+            lineSeparator,
+            javaInput,
+            new JavaCommentsHelper(lineSeparator, options, ImmutableSet.of()),
+            options::indentString);
+    try {
+      format(javaInput, javaOutput, options);
+    } catch (FormattingError e) {
+      throw new FormatterException(e.diagnostics());
+    }
+    RangeSet<Integer> tokenRangeSet = javaInput.characterRangesToTokenRanges(characterRanges);
+    return javaOutput.getFormatReplacements(tokenRangeSet);
+  }
+
+  /// Converts zero-indexed, [closed, open) line ranges in the given source file to character
+  /// ranges.
+  public static RangeSet<Integer> lineRangesToCharRanges(
+      String input, RangeSet<Integer> lineRanges) {
+    List<Integer> lines = new ArrayList<>();
+    Iterators.addAll(lines, Newlines.lineOffsetIterator(input));
+    lines.add(input.length() + 1);
+
+    final RangeSet<Integer> characterRanges = TreeRangeSet.create();
+    for (Range<Integer> lineRange :
+        lineRanges.subRangeSet(Range.closedOpen(0, lines.size() - 1)).asRanges()) {
+      int lineStart = lines.get(lineRange.lowerEndpoint());
+      // Exclude the trailing newline. This isn't strictly necessary, but handling blank lines
+      // as empty ranges is convenient.
+      int lineEnd = lines.get(lineRange.upperEndpoint()) - 1;
+      Range<Integer> range = Range.closedOpen(lineStart, lineEnd);
+      characterRanges.add(range);
+    }
+    return characterRanges;
+  }
+}
